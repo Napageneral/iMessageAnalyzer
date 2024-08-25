@@ -160,6 +160,9 @@ def analyze_imessage_data(sms_db_path):
     conversations = cursor.fetchall()
     conn.close()
     
+    print(f"Sample of first 5 conversations from database: {conversations[:5]}")
+    print(f"Types of first conversation data: {[type(item) for item in conversations[0]]}")
+    
     return conversations
 
 def format_date(timestamp):
@@ -188,20 +191,47 @@ def get_attachments(sms_db_path):
     attachments = cursor.fetchall()
     
     conn.close()
+    print(f"Retrieved {len(attachments)} attachments")
+    print(f"Sample of first 5 attachments: {attachments[:5]}")
     return attachments
 
-def analyze_image_attachments(attachments):
+def analyze_image_attachments(sms_db_path):
+    conn = sqlite3.connect(sms_db_path)
+    cursor = conn.cursor()
+    
+    query = """
+    SELECT 
+        handle.id AS phone_number,
+        message.is_from_me,
+        attachment.mime_type,
+        attachment.total_bytes
+    FROM 
+        message
+    JOIN message_attachment_join 
+        ON message.ROWID = message_attachment_join.message_id
+    JOIN attachment 
+        ON message_attachment_join.attachment_id = attachment.ROWID
+    JOIN handle 
+        ON message.handle_id = handle.ROWID
+    WHERE 
+        attachment.mime_type LIKE 'image/%'
+    """
+    
+    cursor.execute(query)
+    results = cursor.fetchall()
+    conn.close()
+
     image_stats = defaultdict(lambda: {'sent': 0, 'received': 0, 'total_size': 0})
     
-    for handle_id, filename, mime_type, total_bytes in attachments:
-        if mime_type and mime_type.startswith('image/'):
-            if handle_id is not None:
-                image_stats[handle_id]['received'] += 1
-                image_stats[handle_id]['total_size'] += total_bytes
-            else:
-                image_stats['sent']['sent'] += 1
-                image_stats['sent']['total_size'] += total_bytes
-    
+    for phone_number, is_from_me, mime_type, total_bytes in results:
+        if is_from_me:
+            image_stats[phone_number]['sent'] += 1
+        else:
+            image_stats[phone_number]['received'] += 1
+        image_stats[phone_number]['total_size'] += total_bytes
+
+    print(f"Processed {len(results)} images")
+    print(f"Image stats for first 5 handles: {dict(list(image_stats.items())[:5])}")
     return image_stats
 
 def get_all_conversations(conversations, contacts, image_stats):
@@ -224,6 +254,7 @@ def get_all_conversations(conversations, contacts, image_stats):
         
         all_conversations.append({
             "contact_name": contact_name,
+            "identifier": identifier,
             "sent_count": sent_count,
             "received_count": received_count,
             "first_message_date": first_message_date,
@@ -234,8 +265,21 @@ def get_all_conversations(conversations, contacts, image_stats):
             "total_image_size": conversation_image_stats['total_size']
         })
     
+    print(f"Processed {len(all_conversations)} conversations")
+    print(f"Image stats for first 5 conversations: {[{k: v for k, v in conv.items() if k.startswith('image') or k == 'identifier'} for conv in all_conversations[:5]]}")
     return sorted(all_conversations, key=lambda x: x['sent_count'] + x['received_count'], reverse=True)
-
+    
+    print(f"Processed {len(all_conversations)} conversations")
+    print(f"Identifier types in conversations: {identifier_types}")
+    print(f"Image stats keys types: {set(type(k) for k in image_stats.keys())}")
+    print(f"Sample of image stats keys: {list(image_stats.keys())[:5]}")
+    print(f"Sample of conversation identifiers: {[conv['identifier'] for conv in all_conversations[:5]]}")
+    print(f"Image stats for first 5 conversations: {[{k: v for k, v in conv.items() if k.startswith('image') or k == 'identifier'} for conv in all_conversations[:5]]}")
+    return sorted(all_conversations, key=lambda x: x['sent_count'] + x['received_count'], reverse=True)
+    
+    print(f"Processed {len(all_conversations)} conversations")
+    print(f"Image stats for first 5 conversations: {[{k: v for k, v in conv.items() if k.startswith('image')} for conv in all_conversations[:5]]}")
+    return sorted(all_conversations, key=lambda x: x['sent_count'] + x['received_count'], reverse=True)
 def main():
     bundle_dir = get_bundle_dir()
     output_dir = get_output_dir()

@@ -481,13 +481,15 @@ class App(QWidget):
 
             logging.debug("Analyzing iMessage data...")
             imessage_data = analyze_imessage_data(sms_db_path)
+            logging.debug(f"Analyzed {len(imessage_data)} conversations")
             
             logging.debug("Getting contacts...")
             contacts = get_contacts(address_book_path)
+            logging.debug(f"Retrieved {len(contacts)} contacts")
             
             logging.debug("Analyzing image attachments...")
-            attachments = get_attachments(sms_db_path)
-            image_stats = analyze_image_attachments(attachments)
+            image_stats = analyze_image_attachments(sms_db_path)
+            logging.debug(f"Analyzed attachments for {len(image_stats)} conversations")
             
             logging.debug("Analyzing all conversations...")
             all_conversations = get_all_conversations(imessage_data, contacts, image_stats)
