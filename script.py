@@ -116,28 +116,48 @@ def get_contacts(address_book_path):
     conn = sqlite3.connect(address_book_path)
     cursor = conn.cursor()
     
-    # Query for both phone numbers and email addresses
-    cursor.execute("""
-    SELECT ABMultiValue.value, ABPerson.first, ABPerson.last
-    FROM ABMultiValue
-    JOIN ABPerson ON ABMultiValue.record_id = ABPerson.ROWID
-    WHERE ABMultiValue.property IN (3, 4)  -- 3 for phone, 4 for email
-    """)
+    # Check the table structure
+    cursor.execute("PRAGMA table_info(ABPerson)")
+    columns = [column[1] for column in cursor.fetchall()]
     
+    # Adjust the query based on available columns
+    query = """
+    SELECT ABPerson.ROWID, ABPerson.First, ABPerson.Last, ABMultiValue.value
+    """
+    
+    if 'ImageData' in columns:
+        query += ", ABPerson.ImageData"
+    elif 'ThumbnailData' in columns:
+        query += ", ABPerson.ThumbnailData"
+    else:
+        query += ", NULL as ImageData"
+    
+    query += """
+    FROM ABPerson
+    LEFT JOIN ABMultiValue ON ABPerson.ROWID = ABMultiValue.record_id
+    WHERE ABMultiValue.property IN (3, 4)  -- 3 for phone, 4 for email
+    """
+    
+    cursor.execute(query)
     contacts = cursor.fetchall()
     conn.close()
     
     contact_dict = {}
-    for value, first, last in contacts:
+    for row_id, first, last, value, image_data in contacts:
         full_name = f"{first} {last}".strip()
+        if not full_name:
+            full_name = "Unknown"
+        
         if '@' in value:  # It's an email
-            contact_dict[value.lower()] = full_name
+            key = value.lower()
         else:  # It's a phone number
-            normalized = normalize_phone_number(value)
-            contact_dict[normalized] = full_name
-            # Also store the last 10 digits for partial matching
-            if len(normalized) >= 10:
-                contact_dict[normalized[-10:]] = full_name
+            key = normalize_phone_number(value)
+        
+        if key not in contact_dict or (image_data and not contact_dict[key]['image_data']):
+            contact_dict[key] = {
+                'name': full_name,
+                'image_data': image_data
+            }
     
     return contact_dict
 
@@ -237,7 +257,8 @@ def analyze_image_attachments(sms_db_path):
 def get_all_conversations(conversations, contacts, image_stats):
     all_conversations = []
     for identifier, sent_count, received_count, first_message, last_message in conversations:
-        contact_name = contacts.get(normalize_phone_number(identifier), "Unknown")
+        contact_info = contacts.get(normalize_phone_number(identifier), {'name': 'Unknown', 'image_data': None})
+        contact_name = contact_info['name']
         
         first_message_date = format_date(first_message)
         last_message_date = format_date(last_message)
@@ -254,7 +275,6 @@ def get_all_conversations(conversations, contacts, image_stats):
         
         all_conversations.append({
             "contact_name": contact_name,
-            "identifier": identifier,
             "sent_count": sent_count,
             "received_count": received_count,
             "first_message_date": first_message_date,
@@ -262,24 +282,12 @@ def get_all_conversations(conversations, contacts, image_stats):
             "avg_messages_per_day": avg_messages_per_day,
             "images_sent": conversation_image_stats['sent'],
             "images_received": conversation_image_stats['received'],
-            "total_image_size": conversation_image_stats['total_size']
+            "total_image_size": conversation_image_stats['total_size'],
+            "image_data": contact_info['image_data']
         })
     
-    print(f"Processed {len(all_conversations)} conversations")
-    print(f"Image stats for first 5 conversations: {[{k: v for k, v in conv.items() if k.startswith('image') or k == 'identifier'} for conv in all_conversations[:5]]}")
     return sorted(all_conversations, key=lambda x: x['sent_count'] + x['received_count'], reverse=True)
     
-    print(f"Processed {len(all_conversations)} conversations")
-    print(f"Identifier types in conversations: {identifier_types}")
-    print(f"Image stats keys types: {set(type(k) for k in image_stats.keys())}")
-    print(f"Sample of image stats keys: {list(image_stats.keys())[:5]}")
-    print(f"Sample of conversation identifiers: {[conv['identifier'] for conv in all_conversations[:5]]}")
-    print(f"Image stats for first 5 conversations: {[{k: v for k, v in conv.items() if k.startswith('image') or k == 'identifier'} for conv in all_conversations[:5]]}")
-    return sorted(all_conversations, key=lambda x: x['sent_count'] + x['received_count'], reverse=True)
-    
-    print(f"Processed {len(all_conversations)} conversations")
-    print(f"Image stats for first 5 conversations: {[{k: v for k, v in conv.items() if k.startswith('image')} for conv in all_conversations[:5]]}")
-    return sorted(all_conversations, key=lambda x: x['sent_count'] + x['received_count'], reverse=True)
 def main():
     bundle_dir = get_bundle_dir()
     output_dir = get_output_dir()

@@ -3,9 +3,9 @@ import os
 import sqlite3
 from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QVBoxLayout, QTextEdit, QFileDialog, QMessageBox, 
                              QCheckBox, QTabWidget, QTableWidget, QTableWidgetItem, QHBoxLayout, QLineEdit, QLabel,
-                             QDesktopWidget, QHeaderView, QDialog, QProgressBar)
+                             QDesktopWidget, QHeaderView, QDialog, QProgressBar, QScrollArea)
 from PyQt5.QtCore import QTimer, Qt, QSize, QUrl, QSettings
-from PyQt5.QtGui import QIcon, QDesktopServices
+from PyQt5.QtGui import QIcon, QDesktopServices, QPixmap, QImage, QTextCursor, QTextImageFormat, QTextDocument
 import logging
 import traceback
 
@@ -207,7 +207,8 @@ class App(QWidget):
             conn = sqlite3.connect(self.local_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-            SELECT DISTINCT contact_name, sent_count, received_count, first_message_date, last_message_date
+            SELECT contact_name, sent_count, received_count, first_message_date, last_message_date,
+                avg_messages_per_day, images_sent, images_received, total_image_size
             FROM conversations
             ORDER BY sent_count + received_count DESC
             ''')
@@ -216,29 +217,31 @@ class App(QWidget):
 
             self.conversations_table.setSortingEnabled(False)  # Disable sorting while updating
             self.conversations_table.setRowCount(len(conversations))
+            self.conversations_table.setColumnCount(9)  # Update column count
+            self.conversations_table.setHorizontalHeaderLabels([
+                "Contact Name", "Messages Sent", "Messages Received", "Total Messages", 
+                "Images Sent", "Images Received", "Total Image Size (MB)", "First Message", "Last Message"
+            ])
+            
             for row, conv in enumerate(conversations):
-                # Handle 'None' in contact name (first name, last name, or both)
-                contact_name = conv[0] if conv[0] else ''
+                # Process the contact name
+                contact_name = conv[0] if conv[0] else 'Unknown'
                 name_parts = contact_name.split()
                 cleaned_name_parts = [part for part in name_parts if part.lower() != 'none']
-                contact_name = ' '.join(cleaned_name_parts) if cleaned_name_parts else 'Unknown'
+                cleaned_contact_name = ' '.join(cleaned_name_parts) if cleaned_name_parts else 'Unknown'
                 
-                self.conversations_table.setItem(row, 0, QTableWidgetItem(contact_name))
-                
+                self.conversations_table.setItem(row, 0, QTableWidgetItem(cleaned_contact_name))
                 self.conversations_table.setItem(row, 1, NumericTableWidgetItem(conv[1]))
                 self.conversations_table.setItem(row, 2, NumericTableWidgetItem(conv[2]))
                 self.conversations_table.setItem(row, 3, NumericTableWidgetItem(conv[1] + conv[2]))
-                
-                # Handle fake date for first message
-                first_message = conv[3] if conv[3] and conv[3] != 'December 31, 2000' else 'Unknown'
-                self.conversations_table.setItem(row, 4, QTableWidgetItem(first_message))
-                
-                # Handle fake date for last message (just in case)
-                last_message = conv[4] if conv[4] and conv[4] != 'December 31, 2000' else 'Unknown'
-                self.conversations_table.setItem(row, 5, QTableWidgetItem(last_message))
+                self.conversations_table.setItem(row, 4, NumericTableWidgetItem(conv[6]))  # Images sent
+                self.conversations_table.setItem(row, 5, NumericTableWidgetItem(conv[7]))  # Images received
+                self.conversations_table.setItem(row, 6, NumericTableWidgetItem(round(conv[8] / (1024*1024), 2)))  # Total image size in MB
+                self.conversations_table.setItem(row, 7, QTableWidgetItem(conv[3] if conv[3] and conv[3] != 'December 31, 2000' else 'Unknown'))
+                self.conversations_table.setItem(row, 8, QTableWidgetItem(conv[4] if conv[4] and conv[4] != 'December 31, 2000' else 'Unknown'))
 
                 # Set left alignment for all columns
-                for col in range(6):
+                for col in range(9):
                     item = self.conversations_table.item(row, col)
                     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
@@ -329,7 +332,7 @@ class App(QWidget):
                 cursor.execute('''
                 CREATE TABLE conversations
                 (id INTEGER PRIMARY KEY,
-                contact_name TEXT,
+                contact_name TEXT UNIQUE,
                 sent_count INTEGER,
                 received_count INTEGER,
                 first_message_date TEXT,
@@ -355,7 +358,7 @@ class App(QWidget):
                     cursor.execute('''
                     CREATE TABLE conversations
                     (id INTEGER PRIMARY KEY,
-                    contact_name TEXT,
+                    contact_name TEXT UNIQUE,
                     sent_count INTEGER,
                     received_count INTEGER,
                     first_message_date TEXT,
@@ -370,7 +373,7 @@ class App(QWidget):
                     # Copy data from the old table to the new one, handling missing columns
                     old_columns = ', '.join(columns)
                     cursor.execute(f'''
-                    INSERT INTO conversations ({old_columns}, sent_count, received_count, images_sent, images_received, total_image_size)
+                    INSERT OR IGNORE INTO conversations ({old_columns}, sent_count, received_count, images_sent, images_received, total_image_size)
                     SELECT {old_columns}, 
                            CASE WHEN 'message_count' IN ({old_columns}) THEN message_count ELSE 0 END,
                            0, 0, 0, 0
@@ -512,31 +515,77 @@ class App(QWidget):
     def save_results_to_local_db(self, conversations):
         conn = sqlite3.connect(self.local_db_path)
         cursor = conn.cursor()
+        
+        # First, clear the existing data
+        cursor.execute('DELETE FROM conversations')
+        
+        # Prepare the data, summing up values for each contact
+        contact_data = {}
         for conv in conversations:
+            # Clean the contact name
+            name_parts = conv['contact_name'].split()
+            cleaned_name_parts = [part for part in name_parts if part.lower() != 'none']
+            contact_name = ' '.join(cleaned_name_parts) if cleaned_name_parts else 'Unknown'
+            
+            if contact_name not in contact_data:
+                conv['contact_name'] = contact_name  # Use the cleaned name
+                contact_data[contact_name] = conv
+            else:
+                # Sum up the numeric values
+                for key in ['sent_count', 'received_count', 'images_sent', 'images_received', 'total_image_size']:
+                    contact_data[contact_name][key] += conv[key]
+                # Keep the earlier first_message_date and the later last_message_date
+                contact_data[contact_name]['first_message_date'] = min(contact_data[contact_name]['first_message_date'], conv['first_message_date'])
+                contact_data[contact_name]['last_message_date'] = max(contact_data[contact_name]['last_message_date'], conv['last_message_date'])
+        
+        # Now insert the aggregated data
+        for contact_name, conv in contact_data.items():
             cursor.execute('''
-            INSERT INTO conversations 
+            REPLACE INTO conversations 
             (contact_name, sent_count, received_count, first_message_date, last_message_date, 
             avg_messages_per_day, images_sent, images_received, total_image_size)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (conv['contact_name'], conv['sent_count'], conv['received_count'],
+            ''', (contact_name, conv['sent_count'], conv['received_count'],
                 conv['first_message_date'], conv['last_message_date'], conv['avg_messages_per_day'],
                 conv['images_sent'], conv['images_received'], conv['total_image_size']))
+        
         conn.commit()
         conn.close()
 
     def display_top_conversations(self, top_conversations):
-        self.result_text.append("Top 10 Conversations:")
+        self.result_text.clear()
+        cursor = self.result_text.textCursor()
+        
         for i, conv in enumerate(top_conversations, 1):
-            self.result_text.append(f"{i}. Contact: {conv['contact_name']}")
-            self.result_text.append(f"   Messages Sent: {conv['sent_count']}")
-            self.result_text.append(f"   Messages Received: {conv['received_count']}")
-            self.result_text.append(f"   Images Sent: {conv['images_sent']}")
-            self.result_text.append(f"   Images Received: {conv['images_received']}")
-            self.result_text.append(f"   Total Image Size: {conv['total_image_size'] / (1024*1024):.2f} MB")
-            self.result_text.append(f"   First Message: {conv['first_message_date']}")
-            self.result_text.append(f"   Last Message: {conv['last_message_date']}")
-            self.result_text.append(f"   Avg Messages/Day: {conv['avg_messages_per_day']:.2f}")
-            self.result_text.append("")
+            # Insert contact picture
+            if conv.get('image_data'):
+                image = QImage.fromData(conv['image_data'])
+                image = image.scaled(50, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            else:
+                image = QImage(50, 50, QImage.Format_RGB32)
+                image.fill(Qt.lightGray)
+            
+            document = self.result_text.document()
+            image_format = QTextImageFormat()
+            image_format.setWidth(50)
+            image_format.setHeight(50)
+            document.addResource(QTextDocument.ImageResource, QUrl(f"contact_image_{i}"), image)
+            image_format.setName(f"contact_image_{i}")
+            cursor.insertImage(image_format)
+            
+            # Insert conversation info
+            cursor.insertText(f" {i}. Contact: {conv['contact_name']}\n")
+            cursor.insertText(f"   Messages Sent: {conv['sent_count']}\n")
+            cursor.insertText(f"   Messages Received: {conv['received_count']}\n")
+            cursor.insertText(f"   Images Sent: {conv['images_sent']}\n")
+            cursor.insertText(f"   Images Received: {conv['images_received']}\n")
+            cursor.insertText(f"   Total Image Size: {conv['total_image_size'] / (1024*1024):.2f} MB\n")
+            cursor.insertText(f"   First Message: {conv['first_message_date']}\n")
+            cursor.insertText(f"   Last Message: {conv['last_message_date']}\n")
+            cursor.insertText(f"   Avg Messages/Day: {conv['avg_messages_per_day']:.2f}\n\n")
+
+        self.result_text.setTextCursor(cursor)
+        self.result_text.ensureCursorVisible()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
