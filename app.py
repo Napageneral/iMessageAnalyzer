@@ -9,7 +9,7 @@ from PyQt5.QtGui import QIcon, QDesktopServices, QPixmap, QImage, QTextCursor, Q
 import logging
 import traceback
 
-from script import get_attachments, get_file_paths, copy_relevant_files, analyze_imessage_data, get_contacts, get_all_conversations, analyze_image_attachments
+from script import get_attachments, get_file_paths, copy_relevant_files, analyze_imessage_data, get_contacts, get_all_conversations, analyze_image_attachments, analyze_group_chats, clean_contact_name
 
 class NumericTableWidgetItem(QTableWidgetItem):
     def __init__(self, value):
@@ -182,7 +182,79 @@ class App(QWidget):
         conversations_tab.setLayout(conversations_layout)
         self.tab_widget.addTab(conversations_tab, "All Conversations")
 
+        # Add new tab for Group Chat Analysis
+        group_chat_tab = QWidget()
+        group_chat_layout = QVBoxLayout()
+
+        self.analyze_group_chats_button = QPushButton('Analyze Group Chats', self)
+        self.analyze_group_chats_button.clicked.connect(self.on_analyze_group_chats_click)
+        group_chat_layout.addWidget(self.analyze_group_chats_button)
+
+        self.group_chat_table = QTableWidget()
+        self.group_chat_table.setColumnCount(5)
+        self.group_chat_table.setHorizontalHeaderLabels(["Chat Name", "Participants", "Total Messages", "First Message", "Last Message"])
+        self.group_chat_table.setSortingEnabled(True)
+        self.group_chat_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        group_chat_layout.addWidget(self.group_chat_table)
+
+        group_chat_tab.setLayout(group_chat_layout)
+        self.tab_widget.addTab(group_chat_tab, "Group Chats")
+
         self.setLayout(main_layout)
+    
+    def on_analyze_group_chats_click(self):
+        try:
+            if not self.backup_folder:
+                self.result_text.append("No iPhone backup folder found. Please ensure you have a backup on this computer.")
+                return
+
+            logging.info("Starting group chat analysis...")
+
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'imessage_export')
+            sms_db_path = os.path.join(output_dir, 'sms.db')
+            address_book_path = os.path.join(output_dir, 'AddressBook.sqlitedb')
+
+            if not os.path.exists(sms_db_path):
+                self.result_text.append(f"Error: SMS database not found at {sms_db_path}")
+                return
+
+            if not os.path.exists(address_book_path):
+                self.result_text.append(f"Error: Address Book database not found at {address_book_path}")
+                return
+
+            contacts = get_contacts(address_book_path)
+            group_chats = analyze_group_chats(sms_db_path, contacts)
+            if not group_chats:
+                self.result_text.append("No group chats found or error occurred during analysis.")
+                return
+
+            self.display_group_chats(group_chats)
+
+            logging.info("Group chat analysis completed successfully.")
+            self.result_text.append("Group chat analysis completed successfully.")
+
+        except Exception as e:
+            error_msg = f"An error occurred during group chat analysis: {str(e)}\n{traceback.format_exc()}"
+            logging.error(error_msg)
+            self.result_text.append(error_msg)
+            QMessageBox.critical(self, "Error", error_msg)
+
+    def display_group_chats(self, group_chats):
+        self.group_chat_table.setRowCount(len(group_chats))
+        for row, chat in enumerate(group_chats):
+            self.group_chat_table.setItem(row, 0, QTableWidgetItem(str(chat['chat_name'])))
+            
+            # Clean and join participant names
+            cleaned_participants = [clean_contact_name(p) for p in chat['participants']]
+            participants_str = ', '.join(filter(None, cleaned_participants))  # Filter out empty strings
+            self.group_chat_table.setItem(row, 1, QTableWidgetItem(participants_str))
+            
+            self.group_chat_table.setItem(row, 2, NumericTableWidgetItem(chat['total_messages']))
+            self.group_chat_table.setItem(row, 3, QTableWidgetItem(str(chat['first_message'])))
+            self.group_chat_table.setItem(row, 4, QTableWidgetItem(str(chat['last_message'])))
+
+        self.group_chat_table.resizeColumnsToContents()
+        self.group_chat_table.sortItems(2, Qt.DescendingOrder)
 
     def set_app_icon(self):
         if getattr(sys, 'frozen', False):

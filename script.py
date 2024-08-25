@@ -161,6 +161,67 @@ def get_contacts(address_book_path):
     
     return contact_dict
 
+def clean_contact_name(name):
+    parts = name.split()
+    return ' '.join([part for part in parts if part.lower() != 'none'])
+
+def analyze_group_chats(sms_db_path, contacts):
+    conn = sqlite3.connect(sms_db_path)
+    cursor = conn.cursor()
+    
+    query = """
+    SELECT 
+        c.chat_identifier,
+        c.display_name,
+        GROUP_CONCAT(DISTINCT h.id) AS participants,
+        COUNT(DISTINCT m.ROWID) AS total_messages,
+        MIN(m.date) AS first_message,
+        MAX(m.date) AS last_message
+    FROM 
+        chat c
+    JOIN 
+        chat_handle_join chj ON c.ROWID = chj.chat_id
+    JOIN 
+        handle h ON chj.handle_id = h.ROWID
+    LEFT JOIN 
+        chat_message_join cmj ON c.ROWID = cmj.chat_id
+    LEFT JOIN 
+        message m ON cmj.message_id = m.ROWID
+    WHERE 
+        c.chat_identifier LIKE 'chat%'  -- This often indicates a group chat
+    GROUP BY 
+        c.ROWID, c.chat_identifier, c.display_name
+    ORDER BY 
+        total_messages DESC
+    """
+    
+    cursor.execute(query)
+    group_chats = cursor.fetchall()
+    conn.close()
+
+    formatted_group_chats = []
+    for chat in group_chats:
+        chat_name = chat[1] if chat[1] else f"Group Chat {chat[0]}"
+        participants = chat[2].split(',') if chat[2] else []
+        
+        # Match participants to contact names
+        matched_participants = []
+        for participant in participants:
+            normalized_participant = normalize_phone_number(participant)
+            contact_info = contacts.get(normalized_participant, {'name': participant})
+            cleaned_name = clean_contact_name(contact_info['name'])
+            matched_participants.append(cleaned_name if cleaned_name else participant)
+        
+        formatted_group_chats.append({
+            "chat_name": chat_name,
+            "participants": matched_participants,
+            "total_messages": chat[3] or 0,  # Use 0 if NULL
+            "first_message": format_date(chat[4]),
+            "last_message": format_date(chat[5])
+        })
+
+    return formatted_group_chats
+
 def analyze_imessage_data(sms_db_path):
     conn = sqlite3.connect(sms_db_path)
     cursor = conn.cursor()
@@ -186,8 +247,13 @@ def analyze_imessage_data(sms_db_path):
     return conversations
 
 def format_date(timestamp):
-    date = datetime.fromtimestamp(timestamp / 1e9 + 978307200)
-    return date.strftime('%B %d, %Y')
+    if timestamp is None:
+        return "N/A"
+    try:
+        date = datetime.fromtimestamp(timestamp / 1e9 + 978307200)
+        return date.strftime('%B %d, %Y')
+    except (TypeError, ValueError):
+        return "Invalid Date"
 
 def get_attachments(sms_db_path):
     conn = sqlite3.connect(sms_db_path)
