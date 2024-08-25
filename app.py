@@ -3,13 +3,13 @@ import os
 import sqlite3
 from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QVBoxLayout, QTextEdit, QFileDialog, QMessageBox, 
                              QCheckBox, QTabWidget, QTableWidget, QTableWidgetItem, QHBoxLayout, QLineEdit, QLabel,
-                             QDesktopWidget, QHeaderView, QDialog, QProgressBar, QScrollArea)
+                             QDesktopWidget, QHeaderView, QDialog, QProgressBar, QScrollArea, QDialogButtonBox)
 from PyQt5.QtCore import QTimer, Qt, QSize, QUrl, QSettings
 from PyQt5.QtGui import QIcon, QDesktopServices, QPixmap, QImage, QTextCursor, QTextImageFormat, QTextDocument
 import logging
 import traceback
 
-from script import get_attachments, get_file_paths, copy_relevant_files, analyze_imessage_data, get_contacts, get_all_conversations, analyze_image_attachments, analyze_group_chats, clean_contact_name
+from script import get_attachments, get_file_paths, copy_relevant_files, analyze_imessage_data, get_contacts, get_all_conversations, analyze_image_attachments, analyze_group_chats_basic, analyze_single_group_chat, clean_contact_name
 
 class NumericTableWidgetItem(QTableWidgetItem):
     def __init__(self, value):
@@ -84,6 +84,56 @@ def has_full_disk_access():
         readable = os.access(path, os.R_OK)
         results.append(f"{path}: exists={exists}, readable={readable}")
     return "\n".join(results)
+
+class GroupChatDetailsDialog(QDialog):
+    def __init__(self, chat_name, participant_details, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Details for {chat_name}")
+        self.setMinimumSize(500, 400)
+
+        layout = QVBoxLayout()
+
+        details_text = QTextEdit()
+        details_text.setReadOnly(True)
+        
+        details = f"Group Chat: {chat_name}\n\nParticipant Details:\n"
+        
+        participant_details.sort(key=lambda x: (
+            x['name'] != "You",
+            x['name'] == "Unknown Participant",
+            x['name']
+        ))
+        
+        for p in participant_details:
+            details += f"\n{p['name']}:\n"
+            details += f"  Messages sent: {p['message_count']}\n"
+            if p['tapbacks']:
+                details += "  Tapbacks received:\n"
+                total_tapbacks = sum(count for tapback, count in p['tapbacks'].items() if tapback != "No Tapback")
+                no_tapback_count = p['tapbacks'].get("No Tapback", 0)
+                for tapback, count in p['tapbacks'].items():
+                    if tapback != "No Tapback":
+                        rate = (count / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                        details += f"    {tapback}: {count} ({rate:.2f}% of messages)\n"
+                
+                # Calculate the overall tapback rate as the complement of the no-tapback rate
+                overall_rate = (total_tapbacks / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                details += f"  Overall tapback rate: {overall_rate:.2f}%\n"
+                
+                # Add information about messages with no tapbacks
+                no_tapback_rate = (no_tapback_count / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                details += f"  Messages with no tapbacks: {no_tapback_count} ({no_tapback_rate:.2f}% of messages)\n"
+            else:
+                details += "  No tapbacks received\n"
+
+        details_text.setPlainText(details)
+        layout.addWidget(details_text)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        button_box.accepted.connect(self.accept)
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
 
 class App(QWidget):
     def __init__(self):
@@ -182,7 +232,7 @@ class App(QWidget):
         conversations_tab.setLayout(conversations_layout)
         self.tab_widget.addTab(conversations_tab, "All Conversations")
 
-        # Add new tab for Group Chat Analysis
+        # Update Group Chats tab
         group_chat_tab = QWidget()
         group_chat_layout = QVBoxLayout()
 
@@ -195,6 +245,7 @@ class App(QWidget):
         self.group_chat_table.setHorizontalHeaderLabels(["Chat Name", "Participants", "Total Messages", "First Message", "Last Message"])
         self.group_chat_table.setSortingEnabled(True)
         self.group_chat_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.group_chat_table.itemDoubleClicked.connect(self.on_group_chat_double_click)
         group_chat_layout.addWidget(self.group_chat_table)
 
         group_chat_tab.setLayout(group_chat_layout)
@@ -223,7 +274,7 @@ class App(QWidget):
                 return
 
             contacts = get_contacts(address_book_path)
-            group_chats = analyze_group_chats(sms_db_path, contacts)
+            group_chats = analyze_group_chats_basic(sms_db_path, contacts)
             if not group_chats:
                 self.result_text.append("No group chats found or error occurred during analysis.")
                 return
@@ -243,18 +294,37 @@ class App(QWidget):
         self.group_chat_table.setRowCount(len(group_chats))
         for row, chat in enumerate(group_chats):
             self.group_chat_table.setItem(row, 0, QTableWidgetItem(str(chat['chat_name'])))
-            
-            # Clean and join participant names
-            cleaned_participants = [clean_contact_name(p) for p in chat['participants']]
-            participants_str = ', '.join(filter(None, cleaned_participants))  # Filter out empty strings
-            self.group_chat_table.setItem(row, 1, QTableWidgetItem(participants_str))
-            
+            self.group_chat_table.setItem(row, 1, QTableWidgetItem(', '.join(chat['participants'])))
             self.group_chat_table.setItem(row, 2, NumericTableWidgetItem(chat['total_messages']))
             self.group_chat_table.setItem(row, 3, QTableWidgetItem(str(chat['first_message'])))
             self.group_chat_table.setItem(row, 4, QTableWidgetItem(str(chat['last_message'])))
+            
+            # Store chat_identifier as item data for later use
+            self.group_chat_table.item(row, 0).setData(Qt.UserRole, chat['chat_identifier'])
 
         self.group_chat_table.resizeColumnsToContents()
         self.group_chat_table.sortItems(2, Qt.DescendingOrder)
+
+    def on_group_chat_double_click(self, item):
+        row = item.row()
+        chat_name = self.group_chat_table.item(row, 0).text()
+        chat_identifier = self.group_chat_table.item(row, 0).data(Qt.UserRole)
+
+        try:
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'imessage_export')
+            sms_db_path = os.path.join(output_dir, 'sms.db')
+            address_book_path = os.path.join(output_dir, 'AddressBook.sqlitedb')
+
+            contacts = get_contacts(address_book_path)
+            participant_details = analyze_single_group_chat(sms_db_path, chat_identifier, contacts)
+
+            dialog = GroupChatDetailsDialog(chat_name, participant_details, self)
+            dialog.exec_()
+
+        except Exception as e:
+            error_msg = f"An error occurred while fetching group chat details: {str(e)}\n{traceback.format_exc()}"
+            logging.error(error_msg)
+            QMessageBox.critical(self, "Error", error_msg)
 
     def set_app_icon(self):
         if getattr(sys, 'frozen', False):
