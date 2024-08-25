@@ -19,6 +19,7 @@ def run_pyinstaller():
         "--clean",
         "--add-data=assets:assets",
         "--add-data=script.py:.",
+        "--add-data=local_results.db:.",
         "--icon=assets/icon.icns",
         "--hidden-import=sqlite3",
         "--hidden-import=fuzzywuzzy",

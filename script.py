@@ -6,6 +6,17 @@ from collections import defaultdict
 from datetime import datetime
 import re
 from fuzzywuzzy import fuzz
+import sys
+
+def get_bundle_dir():
+    if getattr(sys, 'frozen', False):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+def get_output_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 def analyze_manifest_db(manifest_path):
     if not os.path.exists(manifest_path):
@@ -155,7 +166,45 @@ def format_date(timestamp):
     date = datetime.fromtimestamp(timestamp / 1e9 + 978307200)
     return date.strftime('%B %d, %Y')
 
-def get_all_conversations(conversations, contacts):
+def get_attachments(sms_db_path):
+    conn = sqlite3.connect(sms_db_path)
+    cursor = conn.cursor()
+    
+    query = """
+    SELECT 
+        message.handle_id,
+        attachment.filename,
+        attachment.mime_type,
+        attachment.total_bytes
+    FROM 
+        message
+    JOIN 
+        message_attachment_join ON message.ROWID = message_attachment_join.message_id
+    JOIN 
+        attachment ON message_attachment_join.attachment_id = attachment.ROWID
+    """
+    
+    cursor.execute(query)
+    attachments = cursor.fetchall()
+    
+    conn.close()
+    return attachments
+
+def analyze_image_attachments(attachments):
+    image_stats = defaultdict(lambda: {'sent': 0, 'received': 0, 'total_size': 0})
+    
+    for handle_id, filename, mime_type, total_bytes in attachments:
+        if mime_type and mime_type.startswith('image/'):
+            if handle_id is not None:
+                image_stats[handle_id]['received'] += 1
+                image_stats[handle_id]['total_size'] += total_bytes
+            else:
+                image_stats['sent']['sent'] += 1
+                image_stats['sent']['total_size'] += total_bytes
+    
+    return image_stats
+
+def get_all_conversations(conversations, contacts, image_stats):
     all_conversations = []
     for identifier, sent_count, received_count, first_message, last_message in conversations:
         contact_name = contacts.get(normalize_phone_number(identifier), "Unknown")
@@ -170,66 +219,28 @@ def get_all_conversations(conversations, contacts):
         total_messages = sent_count + received_count
         avg_messages_per_day = total_messages / days_diff if days_diff > 0 else 0
 
+        # Get image attachment stats
+        conversation_image_stats = image_stats.get(identifier, {'sent': 0, 'received': 0, 'total_size': 0})
+        
         all_conversations.append({
             "contact_name": contact_name,
             "sent_count": sent_count,
             "received_count": received_count,
             "first_message_date": first_message_date,
             "last_message_date": last_message_date,
-            "avg_messages_per_day": avg_messages_per_day
+            "avg_messages_per_day": avg_messages_per_day,
+            "images_sent": conversation_image_stats['sent'],
+            "images_received": conversation_image_stats['received'],
+            "total_image_size": conversation_image_stats['total_size']
         })
     
     return sorted(all_conversations, key=lambda x: x['sent_count'] + x['received_count'], reverse=True)
 
-def get_attachments(sms_db_path):
-    conn = sqlite3.connect(sms_db_path)
-    cursor = conn.cursor()
-    
-    query = """
-    SELECT 
-        message.rowid as message_id,
-        attachment.filename
-    FROM 
-        message
-    JOIN 
-        message_attachment_join ON message.rowid = message_attachment_join.message_id
-    JOIN 
-        attachment ON message_attachment_join.attachment_id = attachment.rowid
-    """
-    
-    cursor.execute(query)
-    attachments = cursor.fetchall()
-    
-    conn.close()
-    return attachments
-
-def prepare_data_for_analysis(imessage_data, contact_map, attachments):
-    analyzed_data = []
-    attachment_dict = {}
-    for msg_id, filename in attachments:
-        if msg_id not in attachment_dict:
-            attachment_dict[msg_id] = []
-        attachment_dict[msg_id].append(filename)
-
-    for msg_id, date, text, is_from_me, phone_number in imessage_data:
-        normalized_phone = normalize_phone_number(phone_number)
-        name = contact_map.get(normalized_phone) or contact_map.get(normalized_phone[-10:], phone_number or 'Unknown')
-        analyzed_data.append({
-            'message_id': msg_id,
-            'date': datetime.fromtimestamp(date / 1e9 + 978307200).isoformat(),
-            'text': text,
-            'is_from_me': bool(is_from_me),
-            'contact': name,
-            'phone_number': phone_number or 'Unknown',
-            'attachments': attachment_dict.get(msg_id, [])
-        })
-    return analyzed_data
-
 def main():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    backup_folder = [d for d in os.listdir(current_dir) if d.startswith('00')][0]
-    backup_root = os.path.join(current_dir, backup_folder)
-    output_dir = os.path.join(current_dir, 'imessage_export')
+    bundle_dir = get_bundle_dir()
+    output_dir = get_output_dir()
+    backup_folder = [d for d in os.listdir(output_dir) if d.startswith('00')][0]
+    backup_root = os.path.join(output_dir, backup_folder)
     manifest_path = os.path.join(backup_root, 'Manifest.db')
 
     print("Step 1: Extracting relevant file paths...")
@@ -247,14 +258,18 @@ def main():
     print("Step 4: Mapping contacts...")
     contacts = get_contacts(address_book_path)
 
-    print("Step 5: Calculating all conversations...")
-    all_conversations = get_all_conversations(conversations, contacts)
+    print("Step 5: Analyzing image attachments...")
+    attachments = get_attachments(sms_db_path)
+    image_stats = analyze_image_attachments(attachments)
 
-    print("Step 6: Saving all conversations...")
+    print("Step 6: Calculating all conversations...")
+    all_conversations = get_all_conversations(conversations, contacts, image_stats)
+
+    print("Step 7: Saving all conversations...")
     with open(os.path.join(output_dir, 'all_conversations.json'), 'w') as f:
         json.dump(all_conversations, f, indent=2)
 
-    print("Analysis complete. Results saved in 'imessage_export/all_conversations.json'")
+    print("Analysis complete. Results saved in 'all_conversations.json'")
 
 if __name__ == "__main__":
     main()
