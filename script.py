@@ -7,6 +7,7 @@ from datetime import datetime
 import re
 from fuzzywuzzy import fuzz
 import sys
+import logging
 
 def get_bundle_dir():
     if getattr(sys, 'frozen', False):
@@ -171,62 +172,83 @@ def analyze_group_chats_basic(sms_db_path, contacts):
     conn = sqlite3.connect(sms_db_path)
     cursor = conn.cursor()
     
-    query = """
-    SELECT 
-        c.ROWID as chat_id,
-        c.chat_identifier,
-        c.display_name,
-        GROUP_CONCAT(DISTINCT h.id) AS participants,
-        COUNT(DISTINCT m.ROWID) AS total_messages,
-        MIN(m.date) AS first_message,
-        MAX(m.date) AS last_message
-    FROM 
-        chat c
-    JOIN 
-        chat_handle_join chj ON c.ROWID = chj.chat_id
-    JOIN 
-        handle h ON chj.handle_id = h.ROWID
-    LEFT JOIN 
-        chat_message_join cmj ON c.ROWID = cmj.chat_id
-    LEFT JOIN 
-        message m ON cmj.message_id = m.ROWID
-    WHERE 
-        c.chat_identifier LIKE 'chat%'  -- This often indicates a group chat
-    GROUP BY 
-        c.ROWID, c.chat_identifier, c.display_name
-    ORDER BY 
-        total_messages DESC
-    """
+    # Fetch all group chats and their messages
+    cursor.execute("""
+        SELECT 
+            c.ROWID as chat_id,
+            c.chat_identifier,
+            c.display_name,
+            m.ROWID as message_id,
+            m.date,
+            h.id as participant_id
+        FROM 
+            chat c
+        JOIN 
+            chat_message_join cmj ON c.ROWID = cmj.chat_id
+        JOIN 
+            message m ON cmj.message_id = m.ROWID
+        LEFT JOIN 
+            handle h ON m.handle_id = h.ROWID
+        WHERE 
+            c.chat_identifier LIKE 'chat%'
+        ORDER BY 
+            c.ROWID, m.date
+    """)
     
-    cursor.execute(query)
-    group_chats = cursor.fetchall()
+    all_data = cursor.fetchall()
+    conn.close()
+
+    group_chats = defaultdict(lambda: {
+        'chat_id': None,
+        'chat_identifier': None,
+        'display_name': None,
+        'participants': set(),
+        'total_messages': 0,
+        'first_message': None,
+        'last_message': None
+    })
+
+    for row in all_data:
+        chat_id, chat_identifier, display_name, message_id, date, participant_id = row
+        
+        if group_chats[chat_id]['chat_id'] is None:
+            group_chats[chat_id]['chat_id'] = chat_id
+            group_chats[chat_id]['chat_identifier'] = chat_identifier
+            group_chats[chat_id]['display_name'] = display_name
+
+        group_chats[chat_id]['participants'].add(participant_id)
+        group_chats[chat_id]['total_messages'] += 1
+        
+        if group_chats[chat_id]['first_message'] is None or date < group_chats[chat_id]['first_message']:
+            group_chats[chat_id]['first_message'] = date
+        
+        if group_chats[chat_id]['last_message'] is None or date > group_chats[chat_id]['last_message']:
+            group_chats[chat_id]['last_message'] = date
 
     formatted_group_chats = []
-    for chat in group_chats:
-        chat_id, chat_identifier, display_name, participants, total_messages, first_message, last_message = chat
-        chat_name = display_name if display_name else f"Group Chat {chat_identifier}"
-        participant_list = participants.split(',') if participants else []
+    for chat in group_chats.values():
+        chat_name = chat['display_name'] if chat['display_name'] else f"Group Chat {chat['chat_identifier']}"
         
         # Match participants to contact names
         matched_participants = []
-        for participant in participant_list:
-            normalized_participant = normalize_phone_number(participant)
-            contact_info = contacts.get(normalized_participant, {'name': participant})
-            cleaned_name = clean_contact_name(contact_info['name'])
-            matched_participants.append(cleaned_name if cleaned_name else participant)
+        for participant in chat['participants']:
+            if participant:
+                normalized_participant = normalize_phone_number(participant)
+                contact_info = contacts.get(normalized_participant, {'name': participant})
+                cleaned_name = clean_contact_name(contact_info['name'])
+                matched_participants.append(cleaned_name if cleaned_name else participant)
         
         formatted_group_chats.append({
-            "chat_id": chat_id,
-            "chat_identifier": chat_identifier,
+            "chat_id": chat['chat_id'],
+            "chat_identifier": chat['chat_identifier'],
             "chat_name": chat_name,
             "participants": matched_participants,
-            "total_messages": total_messages or 0,
-            "first_message": format_date(first_message),
-            "last_message": format_date(last_message)
+            "total_messages": chat['total_messages'],
+            "first_message": format_date(chat['first_message']),
+            "last_message": format_date(chat['last_message'])
         })
 
-    conn.close()
-    return formatted_group_chats
+    return sorted(formatted_group_chats, key=lambda x: x['total_messages'], reverse=True)
 
 TAPBACK_MAPPING = {
     0: "No Tapback",
@@ -238,48 +260,73 @@ TAPBACK_MAPPING = {
     3003: "❓ Question"
 }
 
+def clean_guid(guid):
+    if guid and '/' in guid:
+        return guid.split('/')[-1]
+    return guid
+
 def analyze_single_group_chat(sms_db_path, chat_identifier, contacts):
     conn = sqlite3.connect(sms_db_path)
     cursor = conn.cursor()
 
-    # Get message count per participant (including the user)
+    logging.debug(f"Analyzing group chat: {chat_identifier}")
+
+    # Fetch all messages for the chat
     cursor.execute("""
         SELECT 
-            CASE 
-                WHEN m.is_from_me THEN 'user'
-                WHEN h.id IS NULL THEN 'unknown'
-                ELSE h.id
-            END as sender_id,
-            COUNT(*) as message_count
+            m.ROWID,
+            m.guid,
+            m.text,
+            m.handle_id,
+            m.is_from_me,
+            m.associated_message_guid,
+            m.associated_message_type,
+            m.date,
+            h.id as sender_id
         FROM message m
         LEFT JOIN handle h ON m.handle_id = h.ROWID
         WHERE m.cache_roomnames = ?
-        GROUP BY sender_id
+        ORDER BY m.date ASC
     """, (chat_identifier,))
-    participant_message_counts = dict(cursor.fetchall())
+    
+    messages = cursor.fetchall()
+    conn.close()
 
-    # Get tapback counts per participant (including the user)
-    cursor.execute("""
-        SELECT 
-            CASE 
-                WHEN m.is_from_me THEN 'user'
-                WHEN h.id IS NULL THEN 'unknown'
-                ELSE h.id
-            END as sender_id,
-            m.associated_message_type,
-            COUNT(*) as tapback_count
-        FROM message m
-        LEFT JOIN handle h ON m.handle_id = h.ROWID
-        WHERE m.cache_roomnames = ? AND m.associated_message_type IS NOT NULL
-        GROUP BY sender_id, m.associated_message_type
-    """, (chat_identifier,))
-    tapback_counts = defaultdict(lambda: defaultdict(int))
-    for sender_id, tapback_type, count in cursor.fetchall():
-        tapback_counts[sender_id][tapback_type] = count
+    # Initialize counters
+    participant_stats = defaultdict(lambda: {
+        'message_count': 0,
+        'tapbacks_sent': defaultdict(int),
+        'tapbacks_received': defaultdict(int)
+    })
+    message_to_sender = {}
+
+    # First pass: Count messages and store message_guid to sender mapping
+    for row in messages:
+        rowid, guid, text, handle_id, is_from_me, associated_message_guid, associated_message_type, date, sender_id = row
+        
+        sender = 'user' if is_from_me else (sender_id or 'unknown')
+        participant_stats[sender]['message_count'] += 1
+        message_to_sender[clean_guid(guid)] = sender
+
+    # Second pass: Count tapbacks
+    for row in messages:
+        rowid, guid, text, handle_id, is_from_me, associated_message_guid, associated_message_type, date, sender_id = row
+        
+        sender = 'user' if is_from_me else (sender_id or 'unknown')
+
+        if associated_message_type:
+            # This is a Tapback
+            participant_stats[sender]['tapbacks_sent'][associated_message_type] += 1
+            cleaned_associated_guid = clean_guid(associated_message_guid)
+            if cleaned_associated_guid in message_to_sender:
+                original_sender = message_to_sender[cleaned_associated_guid]
+                participant_stats[original_sender]['tapbacks_received'][associated_message_type] += 1
+            else:
+                logging.warning(f"Could not find original message for tapback. GUID: {cleaned_associated_guid}")
 
     # Match participants to contact names and compile stats
     participant_details = []
-    for participant, message_count in participant_message_counts.items():
+    for participant, stats in participant_stats.items():
         if participant == 'user':
             participant_name = "You"
         elif participant == 'unknown':
@@ -290,16 +337,19 @@ def analyze_single_group_chat(sms_db_path, chat_identifier, contacts):
             cleaned_name = clean_contact_name(contact_info['name'])
             participant_name = cleaned_name if cleaned_name else participant
         
-        participant_tapbacks = tapback_counts.get(participant, {})
-        mapped_tapbacks = {TAPBACK_MAPPING.get(t, f"Unknown ({t})"): c for t, c in participant_tapbacks.items()}
+        total_tapbacks_sent = sum(stats['tapbacks_sent'].values())
+        total_tapbacks_received = sum(stats['tapbacks_received'].values())
         
         participant_details.append({
             'name': participant_name,
-            'message_count': message_count,
-            'tapbacks': mapped_tapbacks
+            'message_count': stats['message_count'],
+            'tapbacks_sent': {TAPBACK_MAPPING.get(t, f"Unknown ({t})"): c for t, c in stats['tapbacks_sent'].items()},
+            'tapbacks_received': {TAPBACK_MAPPING.get(t, f"Unknown ({t})"): c for t, c in stats['tapbacks_received'].items()},
+            'total_tapbacks_sent': total_tapbacks_sent,
+            'total_tapbacks_received': total_tapbacks_received
         })
 
-    conn.close()
+    logging.debug(f"Participant details: {participant_details}")
     return participant_details
 
 def analyze_imessage_data(sms_db_path):

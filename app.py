@@ -1,13 +1,17 @@
 import sys
 import os
 import sqlite3
-from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QVBoxLayout, QTextEdit, QFileDialog, QMessageBox, 
+from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QVBoxLayout, QTextEdit, QMessageBox, 
                              QCheckBox, QTabWidget, QTableWidget, QTableWidgetItem, QHBoxLayout, QLineEdit, QLabel,
-                             QDesktopWidget, QHeaderView, QDialog, QProgressBar, QScrollArea, QDialogButtonBox)
+                             QDesktopWidget, QHeaderView, QDialog, QDialogButtonBox)
 from PyQt5.QtCore import QTimer, Qt, QSize, QUrl, QSettings
-from PyQt5.QtGui import QIcon, QDesktopServices, QPixmap, QImage, QTextCursor, QTextImageFormat, QTextDocument
+from PyQt5.QtGui import QIcon, QTextFrameFormat, QPixmap, QImage, QTextImageFormat, QTextDocument, QTextCharFormat, QFont, QTextCharFormat, QFont, QTextTableFormat, QTextLength
 import logging
 import traceback
+import pyperclip
+from PIL import Image, ImageDraw, ImageFont
+import io
+from gc_image import GroupChatImageGenerator
 
 from script import get_attachments, get_file_paths, copy_relevant_files, analyze_imessage_data, get_contacts, get_all_conversations, analyze_image_attachments, analyze_group_chats_basic, analyze_single_group_chat, clean_contact_name
 
@@ -89,7 +93,7 @@ class GroupChatDetailsDialog(QDialog):
     def __init__(self, chat_name, participant_details, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Details for {chat_name}")
-        self.setMinimumSize(500, 400)
+        self.setMinimumSize(600, 500)
 
         layout = QVBoxLayout()
 
@@ -107,24 +111,23 @@ class GroupChatDetailsDialog(QDialog):
         for p in participant_details:
             details += f"\n{p['name']}:\n"
             details += f"  Messages sent: {p['message_count']}\n"
-            if p['tapbacks']:
-                details += "  Tapbacks received:\n"
-                total_tapbacks = sum(count for tapback, count in p['tapbacks'].items() if tapback != "No Tapback")
-                no_tapback_count = p['tapbacks'].get("No Tapback", 0)
-                for tapback, count in p['tapbacks'].items():
-                    if tapback != "No Tapback":
-                        rate = (count / p['message_count']) * 100 if p['message_count'] > 0 else 0
-                        details += f"    {tapback}: {count} ({rate:.2f}% of messages)\n"
-                
-                # Calculate the overall tapback rate as the complement of the no-tapback rate
-                overall_rate = (total_tapbacks / p['message_count']) * 100 if p['message_count'] > 0 else 0
-                details += f"  Overall tapback rate: {overall_rate:.2f}%\n"
-                
-                # Add information about messages with no tapbacks
-                no_tapback_rate = (no_tapback_count / p['message_count']) * 100 if p['message_count'] > 0 else 0
-                details += f"  Messages with no tapbacks: {no_tapback_count} ({no_tapback_rate:.2f}% of messages)\n"
-            else:
-                details += "  No tapbacks received\n"
+            
+            details += "  Tapbacks sent:\n"
+            total_sent = sum(p['tapbacks_sent'].values())
+            for tapback, count in p['tapbacks_sent'].items():
+                rate = (count / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                details += f"    {tapback}: {count} ({rate:.2f}% of messages)\n"
+            
+            details += "  Tapbacks received:\n"
+            total_received = sum(p['tapbacks_received'].values())
+            for tapback, count in p['tapbacks_received'].items():
+                rate = (count / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                details += f"    {tapback}: {count} ({rate:.2f}% of messages)\n"
+            
+            sent_rate = (total_sent / p['message_count']) * 100 if p['message_count'] > 0 else 0
+            received_rate = (total_received / p['message_count']) * 100 if p['message_count'] > 0 else 0
+            details += f"  Overall tapback sent rate: {sent_rate:.2f}%\n"
+            details += f"  Overall tapback received rate: {received_rate:.2f}%\n"
 
         details_text.setPlainText(details)
         layout.addWidget(details_text)
@@ -305,6 +308,240 @@ class App(QWidget):
         self.group_chat_table.resizeColumnsToContents()
         self.group_chat_table.sortItems(2, Qt.DescendingOrder)
 
+
+    def format_tapback_stats(self, tapbacks, total_messages):
+        formatted_stats = []
+        for tapback, count in tapbacks.items():
+            percentage = (count / total_messages) * 100 if total_messages > 0 else 0
+            formatted_stats.append(f"{tapback}: {count} ({percentage:.2f}% of messages)")
+        return formatted_stats
+    
+    def format_group_chat_for_imessage(chat_name, participant_details):
+        formatted_text = f"Group Chat: {chat_name}\n\n"
+
+        for p in sorted(participant_details, key=lambda x: -x['message_count']):
+            if p['message_count'] == 0:
+                continue  # Skip participants with no messages
+
+            formatted_text += f"{p['name']}:\n"
+            formatted_text += f"Messages sent: {p['message_count']}\n\n"
+            
+            formatted_text += "Tapbacks:\n"
+            formatted_text += f"{'Type':<14}{'Sent':>8} {'':>7} | {'Received':>8} {'':>7}\n"
+            
+            all_tapbacks = set(p['tapbacks_sent'].keys()) | set(p['tapbacks_received'].keys())
+            for tapback in sorted(all_tapbacks):
+                if tapback.startswith("Unknown"):
+                    continue
+                sent = p['tapbacks_sent'].get(tapback, 0)
+                received = p['tapbacks_received'].get(tapback, 0)
+                sent_percent = (sent / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                received_percent = (received / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                formatted_text += f"{tapback:<14}{sent:>4} ({sent_percent:>5.1f}%) | {received:>4} ({received_percent:>5.1f}%)\n"
+            
+            formatted_text += f"\nOverall tapback sent rate:     {p['total_tapbacks_sent'] / p['message_count'] * 100:>5.1f}%\n"
+            formatted_text += f"Overall tapback received rate: {p['total_tapbacks_received'] / p['message_count'] * 100:>5.1f}%\n\n"
+            formatted_text += "-" * 50 + "\n\n"
+
+        return formatted_text
+
+
+    def display_group_chat_details(self, chat_name, participant_details):
+        details = QTextEdit()
+        details.setReadOnly(True)
+        
+        cursor = details.textCursor()
+        
+        # Set title
+        title_format = QTextCharFormat()
+        title_format.setFontWeight(QFont.Bold)
+        title_format.setFontPointSize(16)
+        cursor.insertText(f"Group Chat: {chat_name}\n\n", title_format)
+        
+        # Sort participants by message count (descending), then by name
+        # Move "Unknown Participant" to the end regardless of message count
+        sorted_participants = sorted(
+            participant_details, 
+            key=lambda x: (-x['message_count'] if x['name'] != "Unknown Participant" else 0, x['name'])
+        )
+        
+        for p in sorted_participants:
+            if p['message_count'] == 0:
+                continue  # Skip participants with no messages
+            
+            # Participant name
+            name_format = QTextCharFormat()
+            name_format.setFontWeight(QFont.Bold)
+            name_format.setFontPointSize(14)
+            cursor.insertText(f"{p['name']}:\n", name_format)
+            
+            # Messages sent
+            cursor.insertText(f"Messages sent: {p['message_count']}\n")
+            
+            # Tapbacks section
+            tapback_format = QTextCharFormat()
+            tapback_format.setFontWeight(QFont.Bold)
+            cursor.insertText("\nTapbacks:\n", tapback_format)
+            
+            # Create a table for tapback comparison
+            table_format = QTextTableFormat()
+            table_format.setCellPadding(5)
+            table_format.setCellSpacing(0)
+            table_format.setBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+            table_format.setWidth(QTextLength(QTextLength.PercentageLength, 100))
+            
+            all_tapbacks = set(p['tapbacks_sent'].keys()) | set(p['tapbacks_received'].keys())
+            all_tapbacks = [t for t in all_tapbacks if not t.startswith("Unknown")]
+            
+            table = cursor.insertTable(len(all_tapbacks) + 1, 3, table_format)
+            
+            # Table header
+            cursor.insertText("Type")
+            cursor.movePosition(cursor.NextCell)
+            cursor.insertText("Sent")
+            cursor.movePosition(cursor.NextCell)
+            cursor.insertText("Received")
+            cursor.movePosition(cursor.NextCell)
+            
+            for tapback in sorted(all_tapbacks):
+                cursor.insertText(tapback)
+                cursor.movePosition(cursor.NextCell)
+                
+                sent = p['tapbacks_sent'].get(tapback, 0)
+                sent_percent = (sent / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                cursor.insertText(f"{sent} ({sent_percent:.2f}%)")
+                cursor.movePosition(cursor.NextCell)
+                
+                received = p['tapbacks_received'].get(tapback, 0)
+                received_percent = (received / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                cursor.insertText(f"{received} ({received_percent:.2f}%)")
+                cursor.movePosition(cursor.NextCell)
+            
+            cursor.movePosition(cursor.End)
+            
+            # Overall rates
+            cursor.insertText("\n")
+            cursor.insertText(f"Overall tapback sent rate: {p['total_tapbacks_sent'] / p['message_count'] * 100:.2f}%\n")
+            cursor.insertText(f"Overall tapback received rate: {p['total_tapbacks_received'] / p['message_count'] * 100:.2f}%\n\n")
+        
+        return details
+    
+    def generate_group_chat_image(self, chat_name, participant_details):
+            # Filter out unknown participants
+            participant_details = [p for p in participant_details if p['name'] != "Unknown Participant"]
+            
+            # Set up the image
+            width, height = 1000, 200 + (len(participant_details) * 400)
+            image = Image.new('RGB', (width, height), color='#F3F4F6')  # Light gray background
+            draw = ImageDraw.Draw(image)
+
+            try:
+                title_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 36)
+                header_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 28)
+                body_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 20)
+            except IOError:
+                title_font = ImageFont.load_default()
+                header_font = ImageFont.load_default()
+                body_font = ImageFont.load_default()
+
+            # Color palette
+            colors = {
+                'title': '#1F2937',
+                'header': '#374151',
+                'body': '#4B5563',
+                'accent': '#3B82F6',
+                'bar_sent': '#60A5FA',
+                'bar_received': '#34D399'
+            }
+
+            # Emoji to text mapping
+            emoji_map = {
+                '🔱': 'Trident',
+                '❤️': 'Heart',
+                '👍': 'Thumbs Up',
+                '👎': 'Thumbs Down',
+                '😂': 'Laugh',
+                '!!': 'Exclamation'
+            }
+
+            # Draw title
+            chat_name_text = emoji_map.get(chat_name, chat_name)
+            draw.text((30, 30), f"Group Chat: {chat_name_text}", font=title_font, fill=colors['title'])
+
+            y_offset = 100
+            for p in sorted(participant_details, key=lambda x: -x['message_count']):
+                if p['message_count'] == 0:
+                    continue
+
+                # Draw participant section background
+                draw.rectangle([20, y_offset, width - 20, y_offset + 380], fill='white', outline=colors['accent'])
+
+                # Draw participant name and message count
+                draw.text((40, y_offset + 20), f"{p['name']}", font=header_font, fill=colors['header'])
+                draw.text((40, y_offset + 60), f"Messages sent: {p['message_count']}", font=body_font, fill=colors['body'])
+
+                # Draw tapbacks table
+                draw.text((40, y_offset + 100), "Tapbacks:", font=header_font, fill=colors['header'])
+                draw.text((40, y_offset + 140), f"{'Type':<14}{'Sent':>8} {'':>7} | {'Received':>8} {'':>7}", font=body_font, fill=colors['body'])
+
+                table_y = y_offset + 180
+                max_value = max(max(p['tapbacks_sent'].values(), default=0), max(p['tapbacks_received'].values(), default=0), 1)  # Ensure max_value is at least 1
+                all_tapbacks = set(p['tapbacks_sent'].keys()) | set(p['tapbacks_received'].keys())
+                
+                for tapback in sorted(all_tapbacks):
+                    if tapback.startswith("Unknown"):
+                        continue
+                    sent = p['tapbacks_sent'].get(tapback, 0)
+                    received = p['tapbacks_received'].get(tapback, 0)
+                    sent_percent = (sent / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                    received_percent = (received / p['message_count']) * 100 if p['message_count'] > 0 else 0
+
+                    # Draw bars
+                    sent_width = (sent / max_value) * 300
+                    received_width = (received / max_value) * 300
+                    draw.rectangle([300, table_y, 300 + sent_width, table_y + 20], fill=colors['bar_sent'])
+                    draw.rectangle([620, table_y, 620 + received_width, table_y + 20], fill=colors['bar_received'])
+
+                    # Draw text
+                    tapback_text = emoji_map.get(tapback, tapback)
+                    text = f"{tapback_text:<14}{sent:>4} ({sent_percent:>5.1f}%) | {received:>4} ({received_percent:>5.1f}%)"
+                    draw.text((40, table_y), text, font=body_font, fill=colors['body'])
+                    table_y += 30
+
+                # Draw overall rates
+                overall_y = table_y + 20
+                sent_rate = p['total_tapbacks_sent'] / p['message_count'] * 100 if p['message_count'] > 0 else 0
+                received_rate = p['total_tapbacks_received'] / p['message_count'] * 100 if p['message_count'] > 0 else 0
+                draw.text((40, overall_y), f"Overall tapback sent rate: {sent_rate:.1f}%", font=body_font, fill=colors['accent'])
+                draw.text((40, overall_y + 30), f"Overall tapback received rate: {received_rate:.1f}%", font=body_font, fill=colors['accent'])
+
+                y_offset = overall_y + 80
+
+            # Save image to bytes
+            img_byte_arr = io.BytesIO()
+            image.save(img_byte_arr, format='PNG')
+            img_byte_arr = img_byte_arr.getvalue()
+
+            return img_byte_arr
+
+    def copy_formatted_image(self, chat_name, participant_details):
+        try:
+            generator = GroupChatImageGenerator()
+            img_bytes = generator.generate_group_chat_image(chat_name, participant_details)
+
+            # Create a QImage from the bytesß
+            q_image = QImage.fromData(img_bytes)
+            
+            # Create a QPixmap from the QImage
+            pixmap = QPixmap.fromImage(q_image)
+            
+            # Copy the QPixmap to clipboard
+            QApplication.clipboard().setPixmap(pixmap)
+            
+            QMessageBox.information(self, "Success", "Image copied to clipboard!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An error occurred while creating the image: {str(e)}")
+
     def on_group_chat_double_click(self, item):
         row = item.row()
         chat_name = self.group_chat_table.item(row, 0).text()
@@ -318,13 +555,73 @@ class App(QWidget):
             contacts = get_contacts(address_book_path)
             participant_details = analyze_single_group_chat(sms_db_path, chat_identifier, contacts)
 
-            dialog = GroupChatDetailsDialog(chat_name, participant_details, self)
+            logging.debug(f"Participant details for {chat_name}: {participant_details}")
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Details for {chat_name}")
+            dialog.setMinimumSize(800, 600)
+
+            layout = QVBoxLayout()
+
+            details_widget = self.display_group_chat_details(chat_name, participant_details)
+            layout.addWidget(details_widget)
+
+            copy_button = QPushButton("Copy Formatted Text to Clipboard")
+            copy_button.clicked.connect(lambda: self.copy_formatted_text(chat_name, participant_details))
+            layout.addWidget(copy_button)
+
+            copy_image_button = QPushButton("Copy Statistics Image to Clipboard")
+            copy_image_button.clicked.connect(lambda: self.copy_formatted_image(chat_name, participant_details))
+            layout.addWidget(copy_image_button)
+
+            button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+            button_box.accepted.connect(dialog.accept)
+            layout.addWidget(button_box)
+
+            dialog.setLayout(layout)
             dialog.exec_()
 
         except Exception as e:
             error_msg = f"An error occurred while fetching group chat details: {str(e)}\n{traceback.format_exc()}"
             logging.error(error_msg)
             QMessageBox.critical(self, "Error", error_msg)
+
+    def copy_formatted_text(self, chat_name, participant_details):
+        try:
+            formatted_text = self.format_group_chat_for_imessage(chat_name, participant_details)
+            pyperclip.copy(formatted_text)
+            QMessageBox.information(self, "Success", "Formatted text copied to clipboard!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An error occurred while copying: {str(e)}")
+
+    def format_group_chat_for_imessage(self, chat_name, participant_details):
+        formatted_text = f"Group Chat: {chat_name}\n\n"
+
+        for p in sorted(participant_details, key=lambda x: -x['message_count']):
+            if p['message_count'] == 0:
+                continue  # Skip participants with no messages
+
+            formatted_text += f"{p['name']}:\n"
+            formatted_text += f"Messages sent: {p['message_count']}\n\n"
+            
+            formatted_text += "Tapbacks:\n"
+            formatted_text += f"{'Type':<14}{'Sent':>8} {'':>7} | {'Received':>8} {'':>7}\n"
+            
+            all_tapbacks = set(p['tapbacks_sent'].keys()) | set(p['tapbacks_received'].keys())
+            for tapback in sorted(all_tapbacks):
+                if tapback.startswith("Unknown"):
+                    continue
+                sent = p['tapbacks_sent'].get(tapback, 0)
+                received = p['tapbacks_received'].get(tapback, 0)
+                sent_percent = (sent / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                received_percent = (received / p['message_count']) * 100 if p['message_count'] > 0 else 0
+                formatted_text += f"{tapback:<14}{sent:>4} ({sent_percent:>5.1f}%) | {received:>4} ({received_percent:>5.1f}%)\n"
+            
+            formatted_text += f"\nOverall tapback sent rate:     {p['total_tapbacks_sent'] / p['message_count'] * 100:>5.1f}%\n"
+            formatted_text += f"Overall tapback received rate: {p['total_tapbacks_received'] / p['message_count'] * 100:>5.1f}%\n\n"
+            formatted_text += "-" * 50 + "\n\n"
+
+        return formatted_text
 
     def set_app_icon(self):
         if getattr(sys, 'frozen', False):
@@ -730,6 +1027,7 @@ class App(QWidget):
         self.result_text.ensureCursorVisible()
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
     app = QApplication(sys.argv)
     ex = App()
     ex.show()
